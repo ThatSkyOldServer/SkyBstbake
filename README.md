@@ -60,11 +60,14 @@ pip install lz4
 ### 2. Basic Usage
 
 ```bash
+# Get file 
+git clone https://github.com/ThatSkyOldServer/SkyBstbake
+
 # Unpack and split only (generates individual .bin segment files)
-python Sky-Bstbake.py <input.meshes>
+python Sky-Bstbake.py --unpack <input.meshes>
 
 # Unpack + export OBJ model
-python Sky-Bstbake.py <input.meshes> --export-obj
+python Sky-Bstbake.py --unpack <input.meshes> --export-obj
 ```
 
 ### 3. Output Structure
@@ -101,30 +104,6 @@ The exported OBJ file contains the following objects:
 | LVL05+ | Adds METR segment, Cloud mask changes to 2 bytes/pixel, Skirt uses meshopt compression |
 | LVL07+ | Adds GEO0 segment (meshopt-compressed terrain), Terrain data migrates to GEO0 |
 | LVL0B+ | Cloud removes bitmask, switches to 4 compressed chunks |
-
----
-
-## Notes
-
-### ⚠️ Critical Warnings
-
-1. **Baked GI Alpha Channel**: Do **NOT** arbitrarily modify the Alpha channel of global illumination data at vertex offset 28 — the engine's post-processing will produce NaN values, resulting in a **full-screen black screen**.
-
-2. **Meshopt Dynamic Library**: Decompressing v57+ GEO0/Skirt/Cloud data requires the meshopt dynamic library. If not found, the corresponding data cannot be decoded (the script will print a warning but will not abort).
-
-3. **Coordinate System Conversion**: During OBJ export, the Z coordinate is negated (`-p[2]`) to convert from the game engine's left-handed coordinate system to OBJ's standard right-handed coordinate system.
-
-4. **Triangle Winding Order**: Indices are reordered as `i0, i2, i1` during export to match OBJ's counter-clockwise (CCW) face orientation convention.
-
-5. **Memory Usage**: LZ4 decompression uses a fixed 12MB buffer (`0xC00000`). Extra-large map files may require adjustment.
-
-6. **Auto-Install Dependencies**: The script will attempt `pip install lz4` automatically if the `lz4` library is missing. This may fail in restricted environments — please install manually in advance.
-
-### File Requirements
-
-- Input file must begin with the `LVL0` magic bytes
-- File extension is typically `.meshes`
-- Encrypted or signature-verified variant formats are not supported
 
 ---
 
@@ -200,11 +179,14 @@ pip install lz4
 ### 2. 基本用法
 
 ```bash
+# 获取文件
+git clone https://github.com/ThatSkyOldServer/SkyBstbake
+
 # 仅解包拆分（生成各 .bin 段文件）
-python Sky-Bstbake.py <input.meshes>
+python Sky-Bstbake.py --unpack <input.meshes>
 
 # 解包 + 导出 OBJ 模型
-python Sky-Bstbake.py <input.meshes> --export-obj
+python Sky-Bstbake.py --unpack <input.meshes> --export-obj
 ```
 
 ### 3. 输出结构
