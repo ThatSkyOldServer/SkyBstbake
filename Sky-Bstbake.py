@@ -824,7 +824,7 @@ def export_obj_filtered(result, output_dir, base_name):
         def write_vertices(f, verts):
             for v in verts:
                 p = v['pos']
-                f.write(f"v {p[0]:.6f} {p[1]:.6f} {-p[2]:.6f}\n")
+                f.write(f"v {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
 
         def write_faces(f, indices, base_offset, n_verts=None):
             tri_count = len(indices) // 3
@@ -967,7 +967,7 @@ def export_obj_filtered(result, output_dir, base_name):
             if cv and ci:
                 f.write(f"o CloudProxy\nusemtl cloud_proxy\n")
                 for p in cv:
-                    f.write(f"v {p[0]:.6f} {p[1]:.6f} {-p[2]:.6f}\n")
+                    f.write(f"v {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n")
                 n_verts = len(cv)
                 tri_count = len(ci) // 3
                 for t in range(tri_count):
