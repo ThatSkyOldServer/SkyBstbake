@@ -129,7 +129,7 @@ def parse_metr(data, offset, length):
     return {'version': version, 'size': total_size, 'raw': raw_metrics}
 
 
-def parse_geo0(geo_data, result, segments):
+def parse_geo0(geo_data, result, segments, geo_name='GEO0'):
     """解析 GEO0 段 (v57+ 地形数据)。
 
       GEO0 格式:
@@ -260,17 +260,17 @@ def parse_geo0(geo_data, result, segments):
         'patch_count': len(patches),
         'c_entries': c_entries,
     })
-    segments['GEO0.bin'] = geo_data[start_off:len(geo_data)]
+    segments[f'{geo_name}.bin'] = geo_data[start_off:len(geo_data)]
 
 
-def parse_and_split(data, version, metr_data=None, geo_data=None):
+def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0'):
     # LOD 数据解析工具
     off = 0
     result = {'meshes': [], 'terrain': [], 'skirts': [], 'occluder': [], 'cloud': None}
     segments = {}
 
-    if version >= 57:
-        parse_geo0(geo_data, result, segments)
+    if version >= 57 and geo_data is not None:
+        parse_geo0(geo_data, result, segments, geo_name)
 
     # ========================================================
     # Mesh (地图网格烘焙数据)
@@ -981,7 +981,7 @@ def export_obj_filtered(result, output_dir, base_name):
     print(f"  [+] 成功导出模型数据至: {obj_path}")
 
 
-def do_unpack(input_path, export_obj):
+def do_unpack_legacy_single_lod(input_path, export_obj):
     """统一解包入口"""
     with open(input_path, 'rb') as f:
         data = f.read()
@@ -1079,6 +1079,130 @@ def build_header(version: int, lod_offset: int, lod_length: int) -> bytes:
     return bytes(out)
 
 
+def _section_index(name, prefix, fallback):
+    pos = name.find(prefix)
+    suffix = name[pos + len(prefix):] if pos >= 0 else ''
+    digits = ''.join(ch for ch in suffix if ch.isdigit())
+    return int(digits) if digits else fallback
+
+
+def _empty_bst_result():
+    return {'meshes': [], 'terrain': [], 'skirts': [], 'occluder': [], 'cloud': None}
+
+
+def _write_segments(output_dir, segments, seg_names):
+    for seg_name in seg_names:
+        if seg_name in segments:
+            with open(os.path.join(output_dir, seg_name), 'wb') as f:
+                f.write(segments[seg_name])
+
+    for seg_name, seg_data in segments.items():
+        if seg_name not in seg_names:
+            with open(os.path.join(output_dir, seg_name), 'wb') as f:
+                f.write(seg_data)
+
+
+def do_unpack(input_path, export_obj):
+    with open(input_path, 'rb') as f:
+        data = f.read()
+
+    if data[0:4] != b'LVL0':
+        print(f"[!] Not an LVL0 file: {input_path}")
+        return
+
+    file_version = struct.unpack_from('<I', data, 0x04)[0]
+    toc_entry_count = data[0x08]
+    metr_offset, metr_length = 0, 0
+    geo_entries = {}
+    lod_entries = {}
+    group_order = []
+
+    print(f"[*] version={file_version}, toc_entries={toc_entry_count}")
+    for i in range(toc_entry_count):
+        base = 0x08 + 4 + i * 12
+        name = data[base:base + 4].rstrip(b'\x00').decode('ascii', errors='replace')
+        seg_offset = struct.unpack_from('<I', data, base + 4)[0]
+        seg_length = struct.unpack_from('<I', data, base + 8)[0]
+        print(f"    [{i}] {name} off=0x{seg_offset:X} len={seg_length}")
+
+        if 'GEO' in name:
+            group_index = _section_index(name, 'GEO', i)
+            geo_entries[group_index] = (i, name, seg_offset, seg_length)
+            if group_index not in group_order:
+                group_order.append(group_index)
+        elif 'LOD' in name:
+            group_index = _section_index(name, 'LOD', i)
+            lod_entries[group_index] = (i, name, seg_offset, seg_length)
+            if group_index not in group_order:
+                group_order.append(group_index)
+        elif name == 'METR':
+            metr_offset, metr_length = seg_offset, seg_length
+
+    group_order = sorted(set(group_order))
+    if not group_order:
+        print(f"[!] No GEO/LOD segment found: {input_path}")
+        return
+
+    metr_raw = None
+    if file_version >= 55 and metr_length > 0:
+        metr_info = parse_metr(data, metr_offset, metr_length)
+        if metr_info:
+            metr_raw = data[metr_offset:metr_offset + metr_length]
+
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    out_dir = os.path.join(os.path.dirname(input_path), base_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    if file_version >= 57:
+        seg_names = SEGMENT_NAMES_V3
+    elif file_version >= 55:
+        seg_names = SEGMENT_NAMES_V2
+    else:
+        seg_names = SEGMENT_NAMES
+
+    multi_group = len(group_order) > 1
+    print(f"[*] geo_count={len(geo_entries)}, lod_count={len(lod_entries)}, groups={len(group_order)}")
+
+    for group_index in group_order:
+        geo_entry = geo_entries.get(group_index)
+        lod_entry = lod_entries.get(group_index)
+        geo_name = geo_entry[1] if geo_entry else None
+        lod_name = lod_entry[1] if lod_entry else None
+        group_name = '_'.join(name for name in (geo_name, lod_name) if name)
+
+        group_out_dir = os.path.join(out_dir, group_name) if multi_group else out_dir
+        os.makedirs(group_out_dir, exist_ok=True)
+
+        geo_data = None
+        if geo_entry:
+            _, _, geo_offset, geo_length = geo_entry
+            geo_data = data[geo_offset:geo_offset + geo_length]
+            print(f"[*] {geo_name} off=0x{geo_offset:X} len={geo_length}")
+
+        if lod_entry:
+            _, _, lod_offset, lod_length = lod_entry
+            print(f"[*] unpack {lod_name} off=0x{lod_offset:X} len={lod_length}")
+            compressed = data[lod_offset:lod_offset + lod_length]
+            decompressed = lz4.block.decompress(compressed, uncompressed_size=0xC00000)
+            print(f"    decompressed={len(decompressed):,} bytes")
+            result, segments = parse_and_split(decompressed, file_version, metr_raw, geo_data, geo_name or 'GEO0')
+        else:
+            result = _empty_bst_result()
+            segments = {}
+            if geo_data is not None:
+                parse_geo0(geo_data, result, segments, geo_name or 'GEO0')
+            if metr_raw:
+                segments['METR.bin'] = metr_raw
+
+        _write_segments(group_out_dir, segments, seg_names)
+
+        if export_obj:
+            obj_base_name = f"{base_name}_{group_name}" if multi_group else base_name
+            export_obj_filtered(result, group_out_dir, obj_base_name)
+
+    print(f"[+] unpacked {base_name}.meshes v{file_version} -> {out_dir}/")
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="BstBaked Mesh 综合处理工具")
@@ -1086,7 +1210,6 @@ def main():
     group.add_argument("--unpack", type=str, help="指定需要解压的 .meshes 文件或包含它们的目录")
     parser.add_argument("-r", "--recursive", action="store_true", help="允许对目录进行批量/递归处理")
     parser.add_argument("--export-obj", action="store_true", help="在 unpack 时导出 OBJ 信息（跳过 Mesh 几何）")
-    parser.add_argument("--out", type=str, help="仅对单一 repack 有效，指定输出文件路径")
     args = parser.parse_args()
 
     if args.unpack:
