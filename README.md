@@ -11,7 +11,7 @@
 | Item | Description |
 |------|-------------|
 | **Authors** | checion (雨人) & Heriel (落秋) |
-| **External Dependency** | [meshoptimizer](https://github.com/zeux/meshoptimizer) — vertex/index buffer decompression library |
+| **External Dependency** | [meshoptimizer](https://github.com/zeux/meshoptimizer) git submodule — built by CMake for vertex/index buffer decompression |
 | **Runtime** | Python 3.6+ |
 
 ---
@@ -52,17 +52,26 @@
 # Install Python dependency
 pip install lz4
 
-# Ensure the meshopt dynamic library is available (choose one)
-# Option A: Place the provided meshopt2.dll in the _meshopt/ directory next to the script
-# Option B: Build and bundle the meshopt library
+# Clone the repository together with the meshoptimizer submodule
+git clone --recurse-submodules https://github.com/ThatSkyOldServer/SkyBstbake
+cd SkyBstbake
+
+# For an existing checkout, initialize/update the submodule instead
+git submodule update --init --recursive
+
+# Build the platform-native shared library (CMake 3.15+)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
 ```
+
+The build places the library in `_meshopt/lib/`. The filename is selected
+automatically by the Python loader: `meshoptimizer.dll` on Windows,
+`libmeshoptimizer.dylib` on macOS, and `libmeshoptimizer.so` on Linux and
+other supported Unix-like platforms.
 
 ### 2. Basic Usage
 
 ```bash
-# Get file 
-git clone https://github.com/ThatSkyOldServer/SkyBstbake
-
 # Unpack and split only (generates individual .bin segment files)
 python Sky-Bstbake.py --unpack <input.meshes>
 
@@ -130,7 +139,7 @@ The exported OBJ file contains the following objects:
 | 项目 | 说明 |
 |------|------|
 | **作者** | 雨人 (checion) 与 落秋 (Heriel) |
-| **外部依赖模块** | [meshoptimizer](https://github.com/zeux/meshoptimizer) — 顶点/索引缓冲解压缩库 |
+| **外部依赖模块** | [meshoptimizer](https://github.com/zeux/meshoptimizer) Git 子模块 — 由 CMake 编译用于顶点/索引缓冲解压缩 |
 | **运行环境** | Python 3.6+ |
 
 ---
@@ -171,17 +180,25 @@ The exported OBJ file contains the following objects:
 # 安装 Python 依赖
 pip install lz4
 
-# 确保 meshopt 动态库可用（二选一）
-# 方案 A: 将提供的 meshopt2.dll 放置于脚本同目录的 _meshopt/ 下
-# 方案 B: 拉取meshopt库打包
+# 克隆仓库时同时获取 meshoptimizer 子模块
+git clone --recurse-submodules https://github.com/ThatSkyOldServer/SkyBstbake
+cd SkyBstbake
+
+# 已有工作区则初始化/更新子模块
+git submodule update --init --recursive
+
+# 使用 CMake 编译当前平台的动态库（CMake 3.15+）
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
 ```
+
+动态库会生成到 `_meshopt/lib/`。Python 会按平台自动选择文件名：Windows
+使用 `meshoptimizer.dll`，macOS 使用 `libmeshoptimizer.dylib`，Linux 及其他支持的
+类 Unix 平台使用 `libmeshoptimizer.so`。
 
 ### 2. 基本用法
 
 ```bash
-# 获取文件
-git clone https://github.com/ThatSkyOldServer/SkyBstbake
-
 # 仅解包拆分（生成各 .bin 段文件）
 python Sky-Bstbake.py --unpack <input.meshes>
 
