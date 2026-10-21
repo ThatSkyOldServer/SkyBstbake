@@ -1436,6 +1436,7 @@ def build_header(version: int, lod_offset: int, lod_length: int) -> bytes:
 
 
 def _section_index(name, prefix, fallback):
+    """取段名里前缀之后的数字作为组序号；没有数字时用段在 TOC 中的下标。"""
     pos = name.find(prefix)
     suffix = name[pos + len(prefix):] if pos >= 0 else ''
     digits = ''.join(ch for ch in suffix if ch.isdigit())
@@ -1547,7 +1548,8 @@ def do_unpack(input_path, export_obj):
             result = _empty_bst_result()
             segments = {}
             if geo_data is not None:
-                parse_geo0(geo_data, result, segments, geo_name or 'GEO0')
+                # 组内没有 LOD 段时也必须带上文件版本，否则 v56 的 GEO0 会按 v57 解析。
+                parse_geo0(geo_data, result, segments, geo_name or 'GEO0', file_version)
             if metr_raw:
                 segments['METR.bin'] = metr_raw
 

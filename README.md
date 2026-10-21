@@ -38,7 +38,8 @@ This repository only demonstrates the `.meshes` structure in a simple, readable 
 |---------|-------------|
 | `Mesh.bin` | Map mesh baked data (names, GUIDs, submesh indices) |
 | `Terrain.bin` | Terrain vertices + indices + octree + grid culling + hardware tessellation |
-| `GEO0.bin` | v56+ terrain data; v56 uses meshopt index buffers, v57+ uses a meshopt global vertex buffer plus per-patch byte-triplet indices |
+| `GEO0.bin` | v56+ terrain data; v56 uses meshopt index buffers, v57+ uses a meshopt global vertex buffer plus per-patch byte-triplet indices. The trailing digit is a group ordinal, not a version: `GEO1`, `GEO2` … pair with `LOD1`, `LOD2` … |
+| `LOD*.bin` | One LZ4-compressed `LODn` section per group (`Mesh` / `Terrain` / `Cloud` / `Skirt` / `Occluder`). The game may ship several groups, each paired with the `GEOn` of the same ordinal |
 | `WayfinderRegion.bin` | v61+ baked navigation grid, split out of the GEO0 tail (`u32 regionCount`, then per region `u32 cellCount` and 20-byte cells) |
 | `Cloud.bin` | Volumetric cloud sparse block data (distance field / ambient light / proxy mesh) |
 | `Skirt.bin` | Skirt geometry; v57+ rows are 36 bytes, older meshopt rows are 40 bytes with a `a_userData1` tail |
@@ -97,6 +98,10 @@ input/                      # Directory named after the input file
 ├── input.obj               # Exported 3D model
 ├── input_navmesh.obj       # Navigation grid only (v61+, when present)
 ```
+
+When the file contains more than one group, each `GEO<n>` + `LOD<n>` pair is written to
+its own subdirectory named `GEO<n>_LOD<n>`, and the OBJ files are named
+`<input>_GEO<n>_LOD<n>`.
 
 ### 4. OBJ Export Contents
 
@@ -174,7 +179,8 @@ The exported OBJ file contains the following objects:
 |------|------|
 | `Mesh.bin` | 地图网格烘焙数据（名称、GUID、子网格索引） |
 | `Terrain.bin` | 地形顶点 + 索引 + 八叉树 + 网格剔除 + 硬件细分曲面 |
-| `GEO0.bin` | v56+ 地形数据；v56 使用 meshopt 索引缓冲，v57+ 使用 meshopt 全局顶点缓冲 + 每 patch 的字节三元组索引 |
+| `GEO0.bin` | v56+ 地形数据；v56 使用 meshopt 索引缓冲，v57+ 使用 meshopt 全局顶点缓冲 + 每 patch 的字节三元组索引。末尾数字是组序号而非版本：`GEO1`、`GEO2` 依次与 `LOD1`、`LOD2` 配对 |
+| `LOD*.bin` | 每个组一份 LZ4 压缩的 `LODn` 段（Mesh / Terrain / Cloud / Skirt / Occluder）。游戏可能带多组，每组与同序号的 `GEOn` 配对 |
 | `WayfinderRegion.bin` | v61+ 烘焙导航网格，从 GEO0 尾部单独拆出（`u32 regionCount`，每个区域 `u32 cellCount` 与 20 字节 cell） |
 | `Cloud.bin` | 体积云稀疏块数据（距离场 / 环境光 / 代理网格） |
 | `Skirt.bin` | 裙边几何；v57+ 顶点为 36 字节，更早的 meshopt 版本为 40 字节并带 `a_userData1` 尾部 |
@@ -232,6 +238,9 @@ input/                      # 与输入文件同名的目录
 ├── input.obj               # 导出的 3D 模型
 ├── input_navmesh.obj       # 仅导航网格（v61+，存在时）
 ```
+
+文件含多组时，每个 `GEO<n>` + `LOD<n>` 组合写入独立的 `GEO<n>_LOD<n>` 子目录，
+OBJ 文件名为 `<input>_GEO<n>_LOD<n>`。
 
 ### 4. OBJ 导出内容
 
