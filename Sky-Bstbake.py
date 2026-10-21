@@ -16,9 +16,12 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install lz4")
     import lz4.block
 
+# 文件头前 8 字节是 "LVL0" 加 u32 版本号。版本号落在低字节上，且该字节就是
+# ASCII 字符：51..61 依次为 '3'..'='。所以 61 的文件头字面是 "LVL0="，不是 LVL0D。
 SEGMENT_NAMES = ['Mesh.bin', 'Terrain.bin', 'Cloud.bin', 'Skirt.bin', 'Occluder.bin']
 SEGMENT_NAMES_V2 = ['Mesh.bin', 'Terrain.bin', 'Cloud.bin', 'Skirt.bin', 'Occluder.bin', 'METR.bin']
-SEGMENT_NAMES_V3 = ['GEO0.bin', 'Mesh.bin', 'Cloud.bin', 'Skirt.bin', 'Occluder.bin', 'METR.bin']
+SEGMENT_NAMES_V3 = ['GEO0.bin', 'WayfinderRegion.bin', 'Mesh.bin', 'Cloud.bin',
+                    'Skirt.bin', 'Occluder.bin', 'METR.bin']
 
 # ==========================================
 # Meshopt 动态库加载
@@ -117,12 +120,23 @@ def read_string(data, off):
     return s, off + length
 
 
+# 打包方向是有符号字节：值 / 127，-128 单独映射到 -1.0。
+def decode_packed_dir(b):
+    """把一个打包分量字节还原成 [-1, 1] 的浮点。"""
+    signed = b - 256 if b >= 128 else b
+    return -1.0 if signed == -128 else signed / 127.0
+
+
+def decode_packed_dir3(b0, b1, b2):
+    return (decode_packed_dir(b0), decode_packed_dir(b1), decode_packed_dir(b2))
+
+
 # ==========================================
 # Meshopt 解码器
 # ==========================================
 
 def try_decompress_meshopt_vertex(compressed_data, vertex_count, stride):
-    """使用 meshoptimizer 动态库解码顶点缓冲。失败返回 None。"""
+    """解码 meshopt 顶点缓冲。失败返回 None。"""
     lib = _load_meshopt_lib()
     if not lib:
         print("    [!!] meshoptimizer 动态库未加载，无法解码顶点缓冲")
@@ -136,7 +150,7 @@ def try_decompress_meshopt_vertex(compressed_data, vertex_count, stride):
 
 
 def try_decompress_meshopt_index(compressed_data, index_count, index_size=2):
-    """使用 meshoptimizer 动态库解码索引缓冲。失败返回 None。"""
+    """解码 meshopt 索引缓冲。失败返回 None。"""
     lib = _load_meshopt_lib()
     if not lib:
         print("    [!!] meshoptimizer 动态库未加载，无法解码索引缓冲")
@@ -168,89 +182,139 @@ def parse_metr(data, offset, length):
     return {'version': version, 'size': total_size, 'raw': raw_metrics}
 
 
-def parse_geo0(geo_data, result, segments, geo_name='GEO0'):
-    """解析 GEO0 段 (v57+ 地形数据)。
+# GEO0 的 5 个 u32 计数头。第 6 个字（顶点缓冲压缩大小）只在 vertexCount != 0 时读取，
+# 所以没有地形的地图只有一个 20 字节的 GEO0 块。
+GEO0_HEADER_SIZE = 20
 
-      GEO0 格式:
-        24B header: 6×u32 (index_bytes, vert_count, a_cnt, b_cnt, c_cnt, vb_comp_size)
-        meshopt VB (stride=36): 全局顶点缓冲 (所有地形 patch 共享)
-        index buffer: **uint8 字节三元组** (每三角形3字节)
-        Array A (a_cnt×56B): 地形 patch 描述符
-        Array B (b_cnt×56B): Cloud patch 描述符
-        Array C (c_cnt×8B): 元数据( 包含 mat_id 等)
+# v56 的 groupKey：0x00 = 地形，>= 0x50 = 体积云，两者之间是备用细节层（不导出）。
+GEO0_V56_BASE_GROUP_KEY = 0x00
+GEO0_V56_CLOUD_GROUP_KEY = 0x50
 
-      56B patch:
-        u32@0  ib_byte_off  — IB 字节偏移 (指向字节三元组)
-        u32@4  vert_start   — 全局 VB 起始顶点索引
-        u32@8  patch_id     — 全局 patch 编号
-        u32@12 (guid hi16 + ib_byte_len lo16)
-                              低16位 = IB 字节长度 (每 patch 固定 756 = 252 tri × 3)
-        u8@14  vert_count   — 本 patch 顶点数 (≤187, 适合 uint8 索引)
-        u8@15  flags
-        f32×6  AABB         — 局部包围盒
-        u8×16  未知/填充
+# v61 起 GEO0 在 Array C 之后追加 WayfinderRegion 烘焙导航网格：
+#   u32 regionCount;  regionCount × { u32 cellCount; cellCount × 20B cell }
+# cell = i32 x, i32 y, i32 z, f32 border, f32 height
+# 运行时以 (x, y, z) 为 key 做 26 连通洪泛与直线可达判定。
+GEO0_WAYFINDER_MIN_VERSION = 61
+WAYFINDER_CELL_SIZE = 20
+WAYFINDER_CELL_HALF = 0.5
+WAYFINDER_SURFACE_LIFT = 0.05
+WAYFINDER_WALL_DROP = 1.0
+WAYFINDER_WALL_MIN = 0.02
 
-        - 读取 IB 为 unsigned __int8* byte triplets: [i0,i1,i2] [i3,i4,i5] ...
-        - 每 3 字节 = 1 个三角形, 索引为 patch 本地顶点 (0..vert_count-1)
-        - 全局 VB 索引 = vert_start + 本地索引
-    """
-    if not geo_data or len(geo_data) < 24:
-        return
+NAVMESH_MATERIALS = {
+    'navmesh':        (0.20, 0.65, 0.70),
+    'navmesh_border': (0.95, 0.45, 0.10),
+    'navmesh_wall':   (0.12, 0.30, 0.34),
+}
 
-    start_off = 0
-    index_bytes, vert_count, array_a_count, array_b_count, array_c_count, vb_comp_size = \
-        struct.unpack_from('<6I', geo_data, 0)
-    off = 24
+
+def _parse_geo0_header(geo_data):
+    if len(geo_data) < GEO0_HEADER_SIZE:
+        print(f"    [!] GEO0 只有 {len(geo_data)} 字节，不足 20 字节计数头，跳过")
+        return None
+    return list(struct.unpack_from('<5I', geo_data, 0))
+
+def _decode_geo0_vertex_buffer(geo_data, off, vert_count, stride=36):
+    """GEO0 顶点缓冲：u32 压缩大小 + meshopt 顶点流。vert_count==0 时一个字节都不读。"""
+    if vert_count == 0:
+        return [], off
+    vb_comp_size, off = read_u32(geo_data, off)
     vb_comp_data = geo_data[off:off + vb_comp_size]; off += vb_comp_size
-    index_data = geo_data[off:off + index_bytes]; off += index_bytes
-    array_ab_raw = geo_data[off:off + 56 * (array_a_count + array_b_count)]
-    off += 56 * (array_a_count + array_b_count)
-    array_c_raw = geo_data[off:off + 8 * array_c_count]
-    off += 8 * array_c_count
-
-    print(f"  [GEO0] verts={vert_count}, index_bytes={index_bytes}, "
-          f"tris={index_bytes//3}, "
-          f"arrays={array_a_count}/{array_b_count}/{array_c_count}, vb_size={vb_comp_size}")
-    if off != len(geo_data):
-        print(f"    [!] GEO0 size mismatch: parsed={off}, actual={len(geo_data)}")
-
-
+    vb_raw = try_decompress_meshopt_vertex(vb_comp_data, vert_count, stride)
+    if not vb_raw:
+        print(f"    [!] GEO0 meshopt VB 解码失败 (verts={vert_count}, stride={stride})")
+        return None, off
     verts = []
-    vb_raw = try_decompress_meshopt_vertex(vb_comp_data, vert_count, 36)
-    if vb_raw:
-        for vi in range(vert_count):
-            vo = vi * 36
-            x, y, z = struct.unpack_from('<3f', vb_raw, vo)
-            nx_b, ny_b, nz_b, _ = struct.unpack_from('<4B', vb_raw, vo + 12)
-            nx, ny, nz = (nx_b / 255.0) * 2 - 1, (ny_b / 255.0) * 2 - 1, (nz_b / 255.0) * 2 - 1
-            mat_ids = struct.unpack_from('<4B', vb_raw, vo + 16)
-            mat_weights = struct.unpack_from('<4B', vb_raw, vo + 20)
-            v_color = struct.unpack_from('<4B', vb_raw, vo + 24)
-            verts.append({
-                'pos': (x, y, z), 'normal': (nx, ny, nz),
-                'materials': list(zip(mat_ids, mat_weights)),
-                'v_color': v_color
-            })
-        print(f"      meshopt VB OK ({len(verts)} verts)")
-    else:
-        print("      meshopt VB FAILED")
+    for vi in range(vert_count):
+        vo = vi * stride
+        x, y, z = struct.unpack_from('<3f', vb_raw, vo)
+        nx_b, ny_b, nz_b, _ = struct.unpack_from('<4B', vb_raw, vo + 12)
+        mat_ids = struct.unpack_from('<4B', vb_raw, vo + 16)
+        mat_weights = struct.unpack_from('<4B', vb_raw, vo + 20)
+        light_data = struct.unpack_from('<12B', vb_raw, vo + 24)
+        verts.append({
+            'pos': (x, y, z),
+            'normal': decode_packed_dir3(nx_b, ny_b, nz_b),
+            'materials': list(zip(mat_ids, mat_weights)),
+            'light_data': light_data,
+        })
+    return verts, off
 
-    tri_count = index_bytes // 3
-    # print(f"      IB OK ({len(index_data)} bytes = {tri_count} triangles @ 3 bytes/tri)")
+
+def _parse_wayfinder_regions(geo_data, off, version):
+    """读 GEO0 v61+ 尾部的 WayfinderRegion 导航网格，返回 (regions, 新偏移)。"""
+    if version < GEO0_WAYFINDER_MIN_VERSION:
+        return [], off
+
+    regions = []
+    if off + 4 > len(geo_data):
+        return regions, off
+    region_count, off = read_u32(geo_data, off)
+    if region_count > 4096:
+        print(f"    [!] WayfinderRegion 区域数异常 ({region_count})，按无尾部处理")
+        return [], off - 4
+
+    for ri in range(region_count):
+        if off + 4 > len(geo_data):
+            print(f"    [!] WayfinderRegion[{ri}] 头部越界，停止解析")
+            break
+        cell_count, off = read_u32(geo_data, off)
+        if cell_count > (len(geo_data) - off) // WAYFINDER_CELL_SIZE:
+            print(f"    [!] WayfinderRegion[{ri}] cellCount={cell_count} 超出剩余字节，停止解析")
+            break
+        cells = []
+        for _ in range(cell_count):
+            x, y, z = struct.unpack_from('<3i', geo_data, off)
+            col3, col4 = struct.unpack_from('<2f', geo_data, off + 12)
+            cells.append((x, y, z, col3, col4))
+            off += WAYFINDER_CELL_SIZE
+        regions.append({'index': ri, 'cell_count': cell_count, 'cells': cells})
+
+    return regions, off
+
+
+def _parse_geo0_v57(geo_data, header, version=57):
+    """GEO0 版本 57+ 布局。
+
+      5×u32 计数: indexBytes, vertexCount, patchCountA, patchCountB, arrayC
+      [vertexCount != 0] u32 压缩大小 + meshopt VB (stride 36)
+      indexBytes 字节: 每三角形 3 字节，索引是 patch 本地顶点，用 patch 的 vertStart 偏置
+      (patchCountA + patchCountB) × 56B patch 表
+      arrayC × 8B 元数据表
+      [version >= 61] u32 regionCount; regionCount × { u32 cellCount; cellCount × 20B }
+    """
+    index_bytes, vert_count, array_a_count, array_b_count, array_c_count = header
+    off = GEO0_HEADER_SIZE
+    verts, off = _decode_geo0_vertex_buffer(geo_data, off, vert_count)
+    if verts is None:
+        verts = []
+    index_data = geo_data[off:off + index_bytes]; off += index_bytes
+    patch_count = array_a_count + array_b_count
+    array_ab_raw = geo_data[off:off + 56 * patch_count]; off += 56 * patch_count
+    array_c_raw = geo_data[off:off + 8 * array_c_count]; off += 8 * array_c_count
+
+    print(f"  [GEO0/v57] verts={vert_count}, index_bytes={index_bytes}, tris={index_bytes // 3}, "
+          f"arrays={array_a_count}/{array_b_count}/{array_c_count}")
 
     patches = []
-    for i in range(array_a_count + array_b_count):
+    for i in range(patch_count):
         entry = array_ab_raw[i * 56:(i + 1) * 56]
         ib_byte_off = struct.unpack_from('<I', entry, 0)[0]    # IB 字节偏移 (全局)
         vert_start = struct.unpack_from('<I', entry, 4)[0]     # 起始顶点索引 (全局 VB)
         u32_08 = struct.unpack_from('<I', entry, 8)[0]         # patch_id / flags
         u32_0c = struct.unpack_from('<I', entry, 12)[0]        # GUID (低16位=IB字节大小)
         ib_byte_len = struct.unpack_from('<H', entry, 12)[0]   # IB 字节大小 (u16@12)
-        vert_count = entry[14]                                  # 顶点数 (u8@14)
-        u8_0f = entry[15]                                      # 标志位 (2=A类, 其他?)
+        p_vert_count = entry[14]                               # 顶点数 (u8@14)
+        u8_0f = entry[15]                                      # 标志位
         ax, ay, az = struct.unpack_from('<3f', entry, 16)
         bx, by, bz = struct.unpack_from('<3f', entry, 28)
-        leftover = entry[40:56]  # 16B 未处理
+
+        # 展开成全局顶点索引三元组，两个版本共用同一条导出路径。
+        tris = []
+        seg = index_data[ib_byte_off:ib_byte_off + ib_byte_len]
+        for ti in range(len(seg) // 3):
+            bo = ti * 3
+            tris.append((seg[bo] + vert_start, seg[bo + 1] + vert_start, seg[bo + 2] + vert_start))
 
         patches.append({
             'array': 'A' if i < array_a_count else 'B',
@@ -260,24 +324,13 @@ def parse_geo0(geo_data, result, segments, geo_name='GEO0'):
             'ib_byte_off': ib_byte_off,
             'ib_byte_len': ib_byte_len,
             'vert_start': vert_start,
-            'vert_count': vert_count,
-            'vert_end': vert_start + vert_count,
+            'vert_count': p_vert_count,
+            'vert_end': vert_start + p_vert_count,
             'aabb_min': (ax, ay, az),
             'aabb_max': (bx, by, bz),
             'u8_0f': u8_0f,
-            'remainder': leftover,
+            'tris': tris,
         })
-        prev_v1 = vert_start + vert_count
-
-    if patches:
-        a_cnt_actual = array_a_count
-        b_cnt_actual = array_b_count
-        total_vc = sum(p['vert_count'] for p in patches)
-        total_ib = sum(p['ib_byte_len'] for p in patches)
-        # print(f"      Patches: {a_cnt_actual}A + {b_cnt_actual}B = {len(patches)}, "
-        #       f"total_vc={total_vc}, total_ib={total_ib}, "
-        #       f"v_range=[0,{patches[-1]['vert_end']})")
-
 
     c_entries = []
     for i in range(array_c_count):
@@ -290,16 +343,158 @@ def parse_geo0(geo_data, result, segments, geo_name='GEO0'):
             'u8': struct.unpack_from('<8B', raw, 0),
         })
 
-    result['terrain'].append({
+    wayfinder_regions, off = _parse_wayfinder_regions(geo_data, off, version)
+    cells_total = sum(r['cell_count'] for r in wayfinder_regions)
+    border_total = sum(1 for r in wayfinder_regions for c in r['cells'] if c[3] > 0.0)
+    if cells_total:
+        print(f"  [GEO0/v61] WayfinderRegion 导航网格: {len(wayfinder_regions)} 区域, "
+              f"{cells_total} cells, 边界格 {border_total} "
+              f"({100.0 * border_total / cells_total:.1f}%)")
+
+    if off != len(geo_data):
+        print(f"    [!] GEO0 长度不符: 解析到 {off}, 实际 {len(geo_data)}")
+
+    return {
         'linked_id': 0,
         'verts': verts,
-        'ib_raw': index_data,         
-        'tri_count': tri_count,      
+        'ib_raw': index_data,
+        'tri_count': index_bytes // 3,
         'patches': patches,
         'patch_count': len(patches),
         'c_entries': c_entries,
-    })
-    segments[f'{geo_name}.bin'] = geo_data[start_off:len(geo_data)]
+        'wayfinder_regions': wayfinder_regions,
+    }
+
+
+def _parse_geo0_v56(geo_data, header):
+    """GEO0 版本 56 (Sky 0.18.0 / 0.18.1) 布局，与 v57 完全不同。
+
+      5×u32 头: vertexStride(36), vertexCount, indexStride(2 或 4), indexCount, groupCount
+      [vertexCount != 0] u32 压缩大小 + meshopt VB (stride 36)
+      [indexCount  != 0] u32 压缩大小 + meshopt IB (三角形编码)
+      groupCount × {
+          u32 patchCount
+          u32 groupKey                    0x00 地形 / >= 0x50 体积云
+          patchCount × 48B {
+              u32 firstIndex              在全局 IB 上切片，各 group 铺满 [0, indexCount)
+              u32 indexCount
+              f32×6 aabb
+              f32×4 未解析
+          }
+      }
+    """
+    vertex_stride, vert_count, index_stride, index_count, group_count = header
+    if vertex_stride == 0:
+        vertex_stride = 36
+
+    off = GEO0_HEADER_SIZE
+    verts, off = _decode_geo0_vertex_buffer(geo_data, off, vert_count, vertex_stride)
+    if verts is None:
+        verts = []
+
+    print(f"  [GEO0/v56] verts={vert_count}, stride={vertex_stride}, "
+          f"idx={index_count}@{index_stride}B, groups={group_count}")
+
+    indices = []
+    if index_count:
+        ib_comp_size, off = read_u32(geo_data, off)
+        ib_comp_data = geo_data[off:off + ib_comp_size]; off += ib_comp_size
+        if index_stride not in (2, 4):
+            print(f"    [!] GEO0 v56 索引宽度 {index_stride} 不支持")
+        else:
+            ib_raw = try_decompress_meshopt_index(ib_comp_data, index_count, index_stride)
+            if ib_raw:
+                fmt = '<%dH' % index_count if index_stride == 2 else '<%dI' % index_count
+                indices = list(struct.unpack_from(fmt, ib_raw, 0))
+            else:
+                print(f"    [!] GEO0 v56 meshopt IB 解码失败 (idx={index_count})")
+
+    patches = []
+    alternate_runs = 0
+    alternate_tris = 0
+    for g in range(group_count):
+        patch_count, off = read_u32(geo_data, off)
+        group_key, off = read_u32(geo_data, off)
+        entries = geo_data[off:off + patch_count * 48]; off += patch_count * 48
+        if group_key != GEO0_V56_BASE_GROUP_KEY and group_key < GEO0_V56_CLOUD_GROUP_KEY:
+            # 备用细节层：同一批顶点上的另一套三角形，预览不导出。
+            for p in range(patch_count):
+                alternate_tris += struct.unpack_from('<I', entries, p * 48 + 4)[0] // 3
+            alternate_runs += 1
+            continue
+        array = 'B' if group_key >= GEO0_V56_CLOUD_GROUP_KEY else 'A'
+        for p in range(patch_count):
+            e = p * 48
+            first_index = struct.unpack_from('<I', entries, e)[0]
+            p_index_count = struct.unpack_from('<I', entries, e + 4)[0]
+            ax, ay, az = struct.unpack_from('<3f', entries, e + 8)
+            bx, by, bz = struct.unpack_from('<3f', entries, e + 20)
+            tris = []
+            for i in range(first_index, min(first_index + p_index_count, len(indices)) - 2, 3):
+                tris.append((indices[i], indices[i + 1], indices[i + 2]))
+            patches.append({
+                'array': array,
+                'index': len(patches),
+                'patch_id': p,
+                'ib_byte_off': first_index * index_stride,
+                'ib_byte_len': p_index_count * index_stride,
+                'vert_start': 0,
+                'vert_count': vert_count,
+                'vert_end': vert_count,
+                'aabb_min': (ax, ay, az),
+                'aabb_max': (bx, by, bz),
+                'u8_0f': 0,
+                'tris': tris,
+            })
+    if alternate_runs:
+        print(f"    [GEO0/v56] 跳过 {alternate_runs} 个备用细节层 ({alternate_tris} 三角形)")
+
+    if off != len(geo_data):
+        print(f"    [!] GEO0 长度不符: 解析到 {off}, 实际 {len(geo_data)}")
+
+    return {
+        'linked_id': 0,
+        'verts': verts,
+        'ib_raw': None,
+        'tri_count': sum(len(p['tris']) for p in patches),
+        'patches': patches,
+        'patch_count': len(patches),
+        'c_entries': [],
+        'wayfinder_regions': [],
+    }
+
+
+def parse_geo0(geo_data, result, segments, geo_name='GEO0', version=57):
+    """解析 GEO0 段。v56 与 v57+ 是两套不同的布局。"""
+    if not geo_data:
+        return
+    header = _parse_geo0_header(geo_data)
+    if header is None:
+        return
+    if version >= 57:
+        terrain = _parse_geo0_v57(geo_data, header, version)
+    else:
+        terrain = _parse_geo0_v56(geo_data, header)
+    result['terrain'].append(terrain)
+    segments[f'{geo_name}.bin'] = geo_data
+    _write_wayfinder_segment(terrain, segments, geo_name)
+
+
+def _write_wayfinder_segment(terrain, segments, geo_name='GEO0'):
+    """把 WayfinderRegion 原始尾部单独落成一段，格式与 GEO0 尾部逐字节一致：
+
+        u32 regionCount;  regionCount × { u32 cellCount; cellCount × 20B cell }
+    """
+    regions = terrain.get('wayfinder_regions') or []
+    if not regions:
+        return
+    out = bytearray(struct.pack('<I', len(regions)))
+    for region in regions:
+        cells = region['cells']
+        out += struct.pack('<I', len(cells))
+        for x, y, z, border, height in cells:
+            out += struct.pack('<3i2f', x, y, z, border, height)
+    segments['WayfinderRegion.bin'] = bytes(out)
 
 
 def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0'):
@@ -308,8 +503,8 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
     result = {'meshes': [], 'terrain': [], 'skirts': [], 'occluder': [], 'cloud': None}
     segments = {}
 
-    if version >= 57 and geo_data is not None:
-        parse_geo0(geo_data, result, segments, geo_name)
+    if version >= 56 and geo_data is not None:
+        parse_geo0(geo_data, result, segments, geo_name, version)
 
     # ========================================================
     # Mesh (地图网格烘焙数据)
@@ -349,8 +544,8 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
     # ========================================================
     # Terrain / Cloud / Skirt 
     # ========================================================
-    if version >= 57:
-        # ===== v57+ Terrain 已移至 GEO0, Cloud → Skirt (meshopt) =====
+    if version >= 56:
+        # v56+ Terrain 已移至 GEO0，Cloud 改为 Skirt（meshopt）。
 
         # -----------------------------------------------------------
         # 2A. Cloud 体积云稀疏块数据
@@ -408,7 +603,7 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
         segments['Cloud.bin'] = data[start_off:off]
 
         # -----------------------------------------------------------
-        # Skirt (v57: meshopt 压缩, stride=36, 无 UV/切线)
+        # Skirt (v57+: meshopt 压缩, stride=36)
         # 格式: 每裙边 { vc(u32), vb_comp_size(u32), vb_data, ic(u32), ib_comp_size(u32), ib_data }
         # -----------------------------------------------------------
         start_off = off
@@ -438,23 +633,19 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
                     x, y, z = struct.unpack_from('<3f', vb_raw, vo)
                     # 2. 压缩法线 (Packed Normal) - 4 bytes
                     nx_b, ny_b, nz_b, _ = struct.unpack_from('<4B', vb_raw, vo + 12)
-                    nx, ny, nz = (nx_b/255.0)*2-1, (ny_b/255.0)*2-1, (nz_b/255.0)*2-1
+                    nx, ny, nz = decode_packed_dir3(nx_b, ny_b, nz_b)
                     # 3. 材质 ID (Blend Indices) - 4 bytes
                     mat_ids = struct.unpack_from('<4B', vb_raw, vo + 16)
                     # 4. 材质权重 (Blend Weights) - 4 bytes
                     mat_weights = struct.unpack_from('<4B', vb_raw, vo + 20)
-                    # 5. 顶点颜色与 AO (Vertex Color & AO) - 4 bytes
-                    v_color = struct.unpack_from('<4B', vb_raw, vo + 24)
-                    # 6. 全局光照数据 (Baked GI / HDR Light) - 4 bytes
-                    gi_light = struct.unpack_from('<4B', vb_raw, vo + 28)
-                    # 7. 全局元数据 (Global Metadata) - 4 bytes
-                    meta_id = struct.unpack_from('<I', vb_raw, vo + 32)[0]
+                    # 5~7. LightVertexData (烘焙光照) - 12 bytes
+                    light_data = struct.unpack_from('<12B', vb_raw, vo + 24)
 
                     verts.append({
                         'pos': (x, y, z),
                         'normal': (nx, ny, nz),
                         'materials': list(zip(mat_ids, mat_weights)),
-                        'v_color': v_color
+                        'light_data': light_data
                     })
                 indices = list(struct.unpack_from(f'<{index_count}H', ib_raw, 0))
             #     print(f"      meshopt OK ({len(verts)} verts, {len(indices)} idx)")
@@ -498,7 +689,7 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
                 # 2. 压缩法线 (Packed Normal) - 4 bytes
                 # 将 0~255 映射回 -1.0 ~ 1.0 的 3D 方向向量
                 nx_b, ny_b, nz_b, _ = struct.unpack_from('<4B', data, off + 12)
-                nx, ny, nz = (nx_b/255.0)*2-1, (ny_b/255.0)*2-1, (nz_b/255.0)*2-1
+                nx, ny, nz = decode_packed_dir3(nx_b, ny_b, nz_b)
 
                 # 3. 材质 ID (Blend Indices) - 4 bytes
                 # 指向关卡材质调色板 (Palette) 的索引，支持 4 层地表材质混合
@@ -508,23 +699,15 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
                 # 取值 0~255，表示对应材质 ID 的混合浓度
                 mat_weights = struct.unpack_from('<4B', data, off + 20)
 
-                # 5. 顶点颜色与环境光遮蔽 (Vertex Color & AO) - 4 bytes
-                # RGB 改变地形底色，Alpha 通道控制顶点亮度(AO)，0为纯黑
-                v_color = struct.unpack_from('<4B', data, off + 24)
-
-                # 6. 烘焙全局光照 (Baked GI / HDR Light) - 4 bytes
-                # 用于 HDR 环境光渲染，随意修改 Alpha 会导致引擎后处理出现 NaN 使得全屏黑屏
-                gi_light = struct.unpack_from('<4B', data, off + 28)
-
-                # 7. 全局元数据 (Global Metadata) - 4 bytes
-                # 每个地图固定相同的值。地形 UV 通过世界坐标(XY)在 Shader 实时投影计算
-                meta_id = struct.unpack_from('<I', data, off + 32)[0]
+                # 5~7. LightVertexData (烘焙光照) - 12 bytes
+                # 24..35 是 a_light0/1/2；底色来自 16..23 的材质 ID 与权重。
+                light_data = struct.unpack_from('<12B', data, off + 24)
 
                 verts.append({
                     'pos': (x, y, z),
                     'normal': (nx, ny, nz),
                     'materials': list(zip(mat_ids, mat_weights)),
-                    'v_color': v_color
+                    'light_data': light_data
                 })
                 off += 36  # 每顶点 36 字节
 
@@ -550,32 +733,62 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
             # [网格区块数据] (Culling Patches)
             # -----------------------------------------------------
             patches = []
+            patch_tri_edge_counts = []
             for _ in range(patch_count):
-                # 前 4 字节: 当前 3D 网格区块需要渲染的三角形索引数量 (Index Count)
+                # 前 4 字节: 该 patch 的三角形边引用数 (重建索引时要用)
                 p_idx_count = struct.unpack_from('<I', data, off)[0]
                 # 后 4 字节: 该网格在划分空间中的 3D 坐标 (X, Y, Z) + 1字节标志位
                 p_cell_x, p_cell_y, p_cell_z, p_flags = struct.unpack_from('<4B', data, off + 4)
                 patches.append({'idx_count': p_idx_count, 'cell_coord': (p_cell_x, p_cell_y, p_cell_z)})
+                patch_tri_edge_counts.append(p_idx_count)
                 off += 8
 
             # -----------------------------------------------------
-            # [硬件细分曲面] (Tessellation)
-            # 根据相机距离动态增加地形三角形精度的数据
+            # [边压缩索引表] (Edge Tables)
+            # 每 patch 的边数表 + 边对表(两个 u16 端点) + 三角形→边引用表(bit0 选端点)。
             # -----------------------------------------------------
-            tess_tri_edge_count, off = read_u32(data, off)
-            tess_edge_list_count, off = read_u32(data, off)
-            tess_index_count, off = read_u32(data, off)
-            off += 4 * tess_edge_list_count   # Edge List: 每条边 ID (uint32)
-            off += 2 * tess_index_count       # 细分顶点索引 (uint16)
-            off += 4 * tess_tri_edge_count    # 细分三角边 (uint32)
+            tess_tri_edge_count, off = read_u32(data, off)   # patch_edge_count_count
+            tess_edge_list_count, off = read_u32(data, off)  # edge_pair_count
+            tess_index_count, off = read_u32(data, off)      # triangle_edge_count
+
+            edge_pairs = []
+            for _ in range(tess_edge_list_count):
+                a, b = struct.unpack_from('<2H', data, off); off += 4
+                edge_pairs.append((a, b))
+            triangle_edge_refs = list(struct.unpack_from(f'<{tess_index_count}H', data, off))
+            off += 2 * tess_index_count
+            patch_edge_counts = list(struct.unpack_from(f'<{tess_tri_edge_count}I', data, off))
+            off += 4 * tess_tri_edge_count
 
             # -----------------------------------------------------
             # [基础网格索引] (Index Buffer)
-            # 核心数据：告诉 GPU 如何将顶点连成三角形。数据长度必须是 3 的倍数。
-            # 引擎同时利用此数据构建物理碰撞(Collision BVH Tree)。
             # -----------------------------------------------------
-            indices = list(struct.unpack_from(f'<{index_count}H', data, off))
-            off += 2 * index_count
+            if tess_edge_list_count > 0:
+                # 有边对表时必须按引擎逻辑重建索引，不能直接读原始 u16。
+                indices = []
+                tri_offset = 0
+                edge_offset = 0
+                for pi in range(patch_count):
+                    tri_n = patch_tri_edge_counts[pi]
+                    for li in range(tri_n):
+                        pos = tri_offset + li
+                        if pos >= len(triangle_edge_refs):
+                            break
+                        enc = triangle_edge_refs[pos]
+                        ei = edge_offset + (enc >> 1)
+                        if ei >= len(edge_pairs):
+                            continue
+                        indices.append(edge_pairs[ei][enc & 1])
+                    tri_offset += tri_n
+                    edge_offset += patch_edge_counts[pi] if pi < len(patch_edge_counts) else 0
+                if tess_index_count != index_count:
+                    print(f"    [!] blob[{i}] 三角边数 {tess_index_count} != 索引数 {index_count}，"
+                          f"重建得到 {len(indices)} 个索引")
+            else:
+                # 核心数据：告诉 GPU 如何将顶点连成三角形。长度必须是 3 的倍数。
+                # 引擎同时利用此数据构建物理碰撞(Collision BVH Tree)。
+                indices = list(struct.unpack_from(f'<{index_count}H', data, off))
+                off += 2 * index_count
 
             result['terrain'].append({'linked_id': linked_id, 'verts': verts, 'indices': indices})
         segments['Terrain.bin'] = data[start_off:off]
@@ -715,7 +928,7 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
                 ib_comp_size, off = read_u32(data, off)
                 ib_comp_data = data[off:off + ib_comp_size]; off += ib_comp_size
 
-                # meshopt 解压 pos+normal+mat+color+gi+uv+tangent
+                # meshopt 解压 pos+normal+mat+light+userData1
                 stride = 40  # 0x28
                 vb_raw = try_decompress_meshopt_vertex(vb_comp_data, vc, stride)
                 ib_raw = try_decompress_meshopt_index(ib_comp_data, ic, 2)
@@ -728,24 +941,17 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
                         x, y, z = struct.unpack_from('<3f', vb_raw, vo)
                         # 2. 压缩法线 (Packed Normal) - 4 bytes
                         nx_b, ny_b, nz_b, _ = struct.unpack_from('<4B', vb_raw, vo + 12)
-                        nx, ny, nz = (nx_b/255.0)*2-1, (ny_b/255.0)*2-1, (nz_b/255.0)*2-1
+                        nx, ny, nz = decode_packed_dir3(nx_b, ny_b, nz_b)
                         # 3. 材质 ID (Blend Indices) - 4 bytes
                         mat_ids = struct.unpack_from('<4B', vb_raw, vo + 16)
                         # 4. 材质权重 (Blend Weights) - 4 bytes
                         mat_weights = struct.unpack_from('<4B', vb_raw, vo + 20)
-                        # 5. 顶点颜色与 AO (Vertex Color & AO) - 4 bytes
-                        v_color = struct.unpack_from('<4B', vb_raw, vo + 24)
-                        # 6. 烘焙全局光照 (Baked GI / HDR Light) - 4 bytes
-                        gi_light = struct.unpack_from('<4B', vb_raw, vo + 28)
-                        # 7. 显式 UV 坐标 (4 bytes) - 16位 half-float
-                        u, vv = struct.unpack_from('<2e', vb_raw, vo + 32)
-                        # 8. 切线向量 (Tangent) - 4 bytes, Skirt 独有
-                        tx_b, ty_b, tz_b, tw_b = struct.unpack_from('<4B', vb_raw, vo + 36)
-                        tx, ty, tz = (tx_b/255.0)*2-1, (ty_b/255.0)*2-1, (tz_b/255.0)*2-1
+                        # 5~7. LightVertexData (烘焙光照) - 12 bytes
+                        light_data = struct.unpack_from('<12B', vb_raw, vo + 24)
                         verts.append({
                             'pos': (x, y, z), 'normal': (nx, ny, nz),
                             'materials': list(zip(mat_ids, mat_weights)),
-                            'v_color': v_color
+                            'light_data': light_data
                         })
                     indices = list(struct.unpack_from(f'<{ic}H', ib_raw, 0))
                 #     print(f"    skirt[{i}] verts={vc}, idx={ic} (meshopt OK)")
@@ -760,26 +966,19 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
                     x, y, z = struct.unpack_from('<3f', data, off)
                     # 2. 法线 (4)
                     nx_b, ny_b, nz_b, _ = struct.unpack_from('<4B', data, off + 12)
-                    nx, ny, nz = (nx_b/255.0)*2-1, (ny_b/255.0)*2-1, (nz_b/255.0)*2-1
+                    nx, ny, nz = decode_packed_dir3(nx_b, ny_b, nz_b)
                     # 3. 材质 ID (4)
                     mat_ids = struct.unpack_from('<4B', data, off + 16)
                     # 4. 材质权重 (4)
                     mat_weights = struct.unpack_from('<4B', data, off + 20)
-                    # 5. 顶点色与 AO (4)
-                    v_color = struct.unpack_from('<4B', data, off + 24)
-                    # 6. 环境光 GI (4)
-                    gi_light = struct.unpack_from('<4B', data, off + 28)
-                    # 7. 显式 UV 坐标 (4) - 解析为 16位 half-float
-                    u, v = struct.unpack_from('<2e', data, off + 32)
-                    # 8. 切线向量 (4) - Skirt 独有的新增数据
-                    tx_b, ty_b, tz_b, tw_b = struct.unpack_from('<4B', data, off + 36)
-                    tx, ty, tz = (tx_b/255.0)*2-1, (ty_b/255.0)*2-1, (tz_b/255.0)*2-1
+                    # 5~7. LightVertexData (烘焙光照) - 12 bytes
+                    light_data = struct.unpack_from('<12B', data, off + 24)
 
                     verts.append({
                         'pos': (x, y, z),
                         'normal': (nx, ny, nz),
                         'materials': list(zip(mat_ids, mat_weights)),
-                        'v_color': v_color
+                        'light_data': light_data
                     })
                     off += 40
 
@@ -797,23 +996,24 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
     occluder_count, off = read_u32(data, off)
     if version >= 55:
         print(f"  [Occluder] count={occluder_count}")
-    if occluder_count > 0:
-        vc, off = read_u32(data, off)
-        ic, off = read_u32(data, off)
+    # 每块 Occluder 各自带顶点/索引缓冲，按 occluder_count 依次读取。
+    for _ in range(occluder_count):
+            vc, off = read_u32(data, off)
+            ic, off = read_u32(data, off)
 
-        verts = []
-        for _ in range(vc):
-            # 1. 顶点坐标 (12 bytes)
-            x, y, z = struct.unpack_from('<3f', data, off)
-            # 2. 压缩法线 (4 bytes) - 用于 CPU 剔除背面的 Occluder 面片
-            nx_b, ny_b, nz_b, _ = struct.unpack_from('<4B', data, off + 12)
-            nx, ny, nz = (nx_b/255.0)*2-1, (ny_b/255.0)*2-1, (nz_b/255.0)*2-1
-            verts.append({'pos': (x, y, z), 'normal': (nx, ny, nz)})
-            off += 16  # Occluder 顶点精确为 16 字节对齐
+            verts = []
+            for _ in range(vc):
+                # 1. 顶点坐标 (12 bytes)
+                x, y, z = struct.unpack_from('<3f', data, off)
+                # 2. 压缩法线 (4 bytes) - 用于 CPU 剔除背面的 Occluder 面片
+                nx_b, ny_b, nz_b, _ = struct.unpack_from('<4B', data, off + 12)
+                nx, ny, nz = decode_packed_dir3(nx_b, ny_b, nz_b)
+                verts.append({'pos': (x, y, z), 'normal': (nx, ny, nz)})
+                off += 16  # Occluder 顶点精确为 16 字节对齐
 
-        indices = list(struct.unpack_from(f'<{ic}H', data, off))
-        off += 2 * ic
-        result['occluder'].append({'verts': verts, 'indices': indices})
+            indices = list(struct.unpack_from(f'<{ic}H', data, off))
+            off += 2 * ic
+            result['occluder'].append({'verts': verts, 'indices': indices})
     segments['Occluder.bin'] = data[start_off:off]
 
     # ==========================================================
@@ -828,6 +1028,108 @@ def parse_and_split(data, version, metr_data=None, geo_data=None, geo_name='GEO0
 # ==========================================
 # OBJ 导出 (剔除 Mesh 几何)
 # ==========================================
+def _oriented_quad(quad, outward):
+    """按 outward 调整四边形绕序。"""
+    (x0, y0, z0), (x1, y1, z1), (x2, y2, z2), _ = quad
+    ux, uy, uz = x1 - x0, y1 - y0, z1 - z0
+    vx, vy, vz = x2 - x0, y2 - y0, z2 - z0
+    nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+    if nx * outward[0] + ny * outward[1] + nz * outward[2] < 0:
+        return (quad[0], quad[3], quad[2], quad[1])
+    return quad
+
+
+def _navmesh_solid(all_cells, subset):
+    """把一组体素格做成实心块，返回 (顶面, 侧壁) 两组四点元组。
+
+    邻居按 (x, z) 在整个 all_cells 里查；侧壁落到邻居高度，邻居不存在时下落一个体素。
+    """
+    h = WAYFINDER_CELL_HALF
+    lift = WAYFINDER_SURFACE_LIFT
+    col = {(x, z): ht for x, _y, z, _cost, ht in all_cells}
+    tops, walls = [], []
+    for x, _y, z, _cost, ht in subset:
+        top = ht + lift
+        tops.append(((x - h, top, z - h), (x - h, top, z + h),
+                     (x + h, top, z + h), (x + h, top, z - h)))
+        for dx, dz, outward in ((-1, 0, (-1, 0, 0)), (1, 0, (1, 0, 0)),
+                                (0, -1, (0, 0, -1)), (0, 1, (0, 0, 1))):
+            nb = col.get((x + dx, z + dz))
+            lo = top - WAYFINDER_WALL_DROP if nb is None else nb + lift
+            if top - lo < WAYFINDER_WALL_MIN:
+                continue
+            if dx:
+                ex = x + dx * h
+                a, b = (ex, top, z - h), (ex, top, z + h)
+            else:
+                ez = z + dz * h
+                a, b = (x - h, top, ez), (x + h, top, ez)
+            walls.append(_oriented_quad(
+                (a, b, (b[0], lo, b[2]), (a[0], lo, a[2])), outward))
+    return tops, walls
+
+
+def _write_quads(f, quads, v_offset):
+    """写一批四边形，返回新的顶点偏移。先写完顶点再写面。"""
+    for q in quads:
+        for p in q:
+            f.write(f"v {p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
+    for i in range(len(quads)):
+        b = v_offset + i * 4
+        f.write(f"f {b} {b+1} {b+2} {b+3}\n")
+    return v_offset + len(quads) * 4
+
+
+def _navmesh_regions(result):
+    regions = []
+    for t in result.get('terrain', []):
+        for r in (t.get('wayfinder_regions') or []):
+            if r.get('cells'):
+                regions.append(r)
+    return regions
+
+
+def export_navmesh_obj(result, output_dir, base_name):
+    """单独导出只含导航网格的 OBJ。没有 navmesh 时返回 None。"""
+    regions = _navmesh_regions(result)
+    if not regions:
+        return None
+    obj_path = os.path.join(output_dir, f"{base_name}_navmesh.obj")
+    mtl_name = f"{base_name}_navmesh.mtl"
+
+    with open(os.path.join(output_dir, mtl_name), 'w') as mf:
+        mf.write("# WayfinderRegion navmesh materials\n")
+        for name, (r, g, b) in NAVMESH_MATERIALS.items():
+            mf.write(f"\nnewmtl {name}\nKd {r:.4f} {g:.4f} {b:.4f}\n"
+                     f"Ka 0.1 0.1 0.1\nKs 0.0 0.0 0.0\nd 1.0\n")
+
+    total = 0
+    with open(obj_path, 'w') as f:
+        f.write(f"# BstBaked WayfinderRegion navmesh only\nmtllib {mtl_name}\n\n")
+        v_off = 1
+        for r in regions:
+            cells = r['cells']
+            bord = [c for c in cells if c[3] > 0.0]
+            inner = [c for c in cells if c[3] <= 0.0]
+            f.write(f"# region[{r['index']}]: {len(cells)} cells "
+                    f"({len(bord)} border)\n")
+            for name, mat, subset in ((f"NavMesh_{r['index']}", "navmesh", inner),
+                                      (f"NavMesh_{r['index']}_Border", "navmesh_border", bord)):
+                if not subset:
+                    continue
+                tops, walls = _navmesh_solid(cells, subset)
+                f.write(f"o {name}\nusemtl {mat}\n")
+                v_off = _write_quads(f, tops, v_off)
+                total += len(tops)
+                if walls:
+                    f.write(f"usemtl navmesh_wall\n")
+                    v_off = _write_quads(f, walls, v_off)
+                    total += len(walls)
+                f.write("\n")
+    print(f"  [+] 独立导航网格 OBJ: {obj_path} ({total} 面, 顶面+侧壁)")
+    return obj_path
+
+
 def export_obj_filtered(result, output_dir, base_name):
     obj_path = os.path.join(output_dir, f"{base_name}.obj")
     mtl_path = os.path.join(output_dir, f"{base_name}.mtl")
@@ -850,6 +1152,9 @@ def export_obj_filtered(result, output_dir, base_name):
         (0.3, 0.7, 0.5), (0.6, 0.6, 0.3), (0.4, 0.5, 0.5), (0.5, 0.3, 0.4),
     ]
     get_material("geo0_patch_base", (0.25, 0.55, 0.25))
+    if _navmesh_regions(result):
+        for nm, rgb in NAVMESH_MATERIALS.items():
+            get_material(nm, rgb)
 
     with open(mtl_path, 'w') as mf:
         mf.write(f"# BstBaked materials\n")
@@ -902,7 +1207,7 @@ def export_obj_filtered(result, output_dir, base_name):
             patches = t.get('patches')
             ib_raw = t.get('ib_raw')
             
-            if ib_raw and patches:
+            if patches:
                 all_verts = t['verts']
                 c_entries = t.get('c_entries')
                 
@@ -917,7 +1222,7 @@ def export_obj_filtered(result, output_dir, base_name):
                 
                 # --- Terrain 
                 if terrain_patches:
-                    group_tris = sum(p['ib_byte_len'] // 3 for p in terrain_patches)
+                    group_tris = sum(len(p['tris']) for p in terrain_patches)
                     total_tris += group_tris
                     vc_min = min(p['vert_count'] for p in terrain_patches)
                     vc_max = max(p['vert_count'] for p in terrain_patches)
@@ -926,23 +1231,15 @@ def export_obj_filtered(result, output_dir, base_name):
                     f.write(f"# patches={len(terrain_patches)} tris={group_tris} vc_range=[{vc_min},{vc_max}]\n")
                     
                     for patch in terrain_patches:
-                        ib_start = patch['ib_byte_off']
-                        ib_end = ib_start + patch['ib_byte_len']
-                        patch_bytes = ib_raw[ib_start:ib_end]
-                        tri_count = len(patch_bytes) // 3
-                        if tri_count == 0:
+                        tris = patch.get('tris')
+                        if not tris:
                             continue
-                        vs = patch['vert_start']
-                        for ti in range(tri_count):
-                            bo = ti * 3
-                            i0 = patch_bytes[bo] + vs
-                            i1 = patch_bytes[bo + 1] + vs
-                            i2 = patch_bytes[bo + 2] + vs
+                        for i0, i1, i2 in tris:
                             f.write(f"f {i0 + base_v} {i2 + base_v} {i1 + base_v}\n")
                 
                 # --- CloudProxy 
                 if cloud_patches:
-                    group_tris = sum(p['ib_byte_len'] // 3 for p in cloud_patches)
+                    group_tris = sum(len(p['tris']) for p in cloud_patches)
                     total_tris += group_tris
                     vc_min = min(p['vert_count'] for p in cloud_patches)
                     vc_max = max(p['vert_count'] for p in cloud_patches)
@@ -951,18 +1248,10 @@ def export_obj_filtered(result, output_dir, base_name):
                     f.write(f"# patches={len(cloud_patches)} tris={group_tris} vc_range=[{vc_min},{vc_max}]\n")
                     
                     for patch in cloud_patches:
-                        ib_start = patch['ib_byte_off']
-                        ib_end = ib_start + patch['ib_byte_len']
-                        patch_bytes = ib_raw[ib_start:ib_end]
-                        tri_count = len(patch_bytes) // 3
-                        if tri_count == 0:
+                        tris = patch.get('tris')
+                        if not tris:
                             continue
-                        vs = patch['vert_start']
-                        for ti in range(tri_count):
-                            bo = ti * 3
-                            i0 = patch_bytes[bo] + vs
-                            i1 = patch_bytes[bo + 1] + vs
-                            i2 = patch_bytes[bo + 2] + vs
+                        for i0, i1, i2 in tris:
                             f.write(f"f {i0 + base_v} {i2 + base_v} {i1 + base_v}\n")
                 
                 f.write(f"\n# ===== GEO0 Summary: {len(patches)} patches, {total_tris} triangles =====\n")
@@ -1017,11 +1306,40 @@ def export_obj_filtered(result, output_dir, base_name):
                 f.write("\n")
                 # print(f"  [+] Cloud Proxy: {len(cv)} verts, {tri_count} tris")
 
+        # --- WayfinderRegion 导航网格 (GEO0 v61+) ---
+        # 每格一个顶面 + 四周侧壁；NavMesh_i 为内部格，NavMesh_i_Border 为边界格。
+        navmesh_quads = 0
+        for r in _navmesh_regions(result):
+            cells = r['cells']
+            border = [c for c in cells if c[3] > 0.0]
+            inner = [c for c in cells if c[3] <= 0.0]
+            f.write(f"# ===== WayfinderRegion[{r['index']}] navmesh: {len(cells)} cells, "
+                    f"{len(border)} border =====\n")
+            for name, mat, subset in (
+                (f"NavMesh_{r['index']}", "navmesh", inner),
+                (f"NavMesh_{r['index']}_Border", "navmesh_border", border),
+            ):
+                if not subset:
+                    continue
+                tops, walls = _navmesh_solid(cells, subset)
+                f.write(f"o {name}\nusemtl {mat}\n")
+                global_v_offset = _write_quads(f, tops, global_v_offset)
+                navmesh_quads += len(tops)
+                if walls:
+                    f.write("usemtl navmesh_wall\n")
+                    global_v_offset = _write_quads(f, walls, global_v_offset)
+                    navmesh_quads += len(walls)
+                f.write("\n")
+
+    if navmesh_quads:
+        print(f"  [+] 导航网格已并入 OBJ: {navmesh_quads} 面 "
+              f"(青色=可走区域, 橙色=崖边/边界格, 暗色=侧壁)")
     print(f"  [+] 成功导出模型数据至: {obj_path}")
+    export_navmesh_obj(result, output_dir, base_name)
 
 
 def do_unpack_legacy_single_lod(input_path, export_obj):
-    """统一解包入口"""
+    """解包入口。"""
     with open(input_path, 'rb') as f:
         data = f.read()
 
@@ -1071,9 +1389,8 @@ def do_unpack_legacy_single_lod(input_path, export_obj):
     decompressed = lz4.block.decompress(compressed, uncompressed_size=0xC00000)
     print(f"[*] 解压完成，原始大小={len(decompressed):,} bytes")
 
-    # GEO0
     geo_data = None
-    if file_version >= 57 and geo0_length > 0:
+    if geo0_length > 0:
         geo_data = data[geo0_offset:geo0_offset + geo0_length]
         print(f"[*] 提取 GEO0 数据 (offset=0x{geo0_offset:X}, length={geo0_length})")
 
@@ -1083,8 +1400,8 @@ def do_unpack_legacy_single_lod(input_path, export_obj):
 
     result, segments = parse_and_split(decompressed, file_version, metr_raw, geo_data)
 
-    # 写入分段文件
-    if file_version >= 57:
+    # 有 GEO0 段时使用 V3 命名（v56 起）。
+    if geo0_length > 0:
         seg_names = SEGMENT_NAMES_V3
     elif file_version >= 55:
         seg_names = SEGMENT_NAMES_V2
@@ -1102,7 +1419,7 @@ def do_unpack_legacy_single_lod(input_path, export_obj):
 
 
 # ==========================================
-# 重新打包的文件头参考（在0.3.18经过测试可用）
+# 文件头参考
 # ==========================================
 def build_header(version: int, lod_offset: int, lod_length: int) -> bytes:
     out = bytearray(132)
@@ -1192,7 +1509,8 @@ def do_unpack(input_path, export_obj):
     out_dir = os.path.join(os.path.dirname(input_path), base_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    if file_version >= 57:
+    # 有 GEO0 段时使用 V3 命名（v56 起）。
+    if geo_entries:
         seg_names = SEGMENT_NAMES_V3
     elif file_version >= 55:
         seg_names = SEGMENT_NAMES_V2
